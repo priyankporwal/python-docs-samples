@@ -1,16 +1,5 @@
 # Copyright 2025 Google LLC.
-#
-# Licensed under the Apache License, Version 2.0 (the 'License');
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Licensed under the Apache License, Version 2.0.
 
 import concurrent.futures
 import logging
@@ -19,53 +8,25 @@ import time
 
 from google.api_core import exceptions as google_exceptions
 from google.api_core import retry
-from google.cloud import storage_control_v2
+from google.cloud import storage  # For object operations
+from google.cloud import storage_control_v2 # For folder operations
 import grpc
 
 ThreadPoolExecutor = concurrent.futures.ThreadPoolExecutor
 
-# This script may be used to recursively delete a large number of nested empty
-# folders in a GCS HNS bucket. Overview of the algorithm:
-# 1. Folder Discovery:
-#    - Lists all folders under the BUCKET_NAME and FOLDER_PREFIX (if set).
-#    - Partitions all discovered folders into a map, keyed by depth
-#      (e.g. {1: [foo1/ foo2/], 2: [foo1/bar1/, foo1/bar2/, foo2/bar3/], ...}
-# 2. Folder Deletion:
-#    - Processes depths in reverse order (from deepest to shallowest).
-#    - For each depth level, submits all folders at that level to a thread pool
-#      for parallel deletion.
-#    - Only moves to the next depth level once all folders at the current depth
-#      have been processed. This ensures that child folders are removed before
-#      their parents, respecting hierarhical constraints.
-#
-# Note: This script only deletes folders, not objects; any folders with child
-# objects (immediate or nested) will fail to be deleted.
-#
-# Usage: See README.md for instructions.
-
 # --- Configuration ---
 BUCKET_NAME = "your-gcs-bucket-name"
-
-# e.g. "archive/old_data/" or "" to delete all folders in the bucket.
-# If specified, must end with '/'.
-FOLDER_PREFIX = "chain_103/"
-
-# Max number of concurrent threads to use for deleting folders.
+FOLDER_PREFIX = "chain_103/" # Must end with '/'
 MAX_WORKERS = 100
-
-# How often to log statistics during deletion, in seconds.
 STATS_REPORT_INTERVAL = 5
+DELETE_OBJECTS_FIRST = True  # Set to True to clear all files before folders
 
 # --- Data Structures & Globals ---
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(threadName)s - %(message)s"
 )
 
-# Global map to store folders by their depth
-# { depth (int) -> set of full_resource_names (str) }
 folders_by_depth = {}
-
-# Stats for monitoring progress
 stats = {
     "found_total": 0,
     "successful_deletes": 0,
@@ -74,324 +35,154 @@ stats = {
 }
 stats_lock = threading.Lock()
 
-# Initialize the Storage Control API client
 storage_control_client = storage_control_v2.StorageControlClient()
+storage_client = storage.Client()
 
+# --- Object Deletion Logic (Batching) ---
+
+def delete_batch_of_blobs(blob_names_chunk: list):
+    """Deletes a chunk of up to 100 blobs using a single batch request."""
+    try:
+        with storage_client.batch():
+            bucket = storage_client.bucket(BUCKET_NAME)
+            for name in blob_names_chunk:
+                bucket.delete_blob(name)
+        return len(blob_names_chunk)
+    except Exception as e:
+        logging.error(f"Batch deletion failed for a chunk: {e}")
+        return 0
+
+def clear_all_objects_batched():
+    """Discovers and deletes all objects under FOLDER_PREFIX in parallel batches."""
+    logging.info(f"Scanning for objects to delete in bucket '{BUCKET_NAME}'...")
+    blobs = storage_client.list_blobs(BUCKET_NAME, prefix=FOLDER_PREFIX)
+    blob_names = [blob.name for blob in blobs if not blob.name.endswith('/')]
+
+    if not blob_names:
+        logging.info("No objects found to delete.")
+        return
+
+    chunk_size = 100
+    chunks = [blob_names[i:i + chunk_size] for i in range(0, len(blob_names), chunk_size)]
+    
+    logging.info(f"Found {len(blob_names)} objects. Executing {len(chunks)} batch requests...")
+    
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        results = list(executor.map(delete_batch_of_blobs, chunks))
+    
+    logging.info(f"Object deletion complete. Total deleted: {sum(results)}")
+
+# --- Folder Deletion Logic ---
 
 def _get_simple_path_and_depth(full_resource_name: str) -> tuple[str, int]:
-  """Extracts bucket-relative path and depth from a GCS folder resource name.
+    base_folders_prefix = f"projects/_/buckets/{BUCKET_NAME}/folders/"
+    expected_validation_prefix = base_folders_prefix + FOLDER_PREFIX
 
-  The "simple path" is relative to the bucket (e.g., 'archive/logs/' for
-  'projects/_/buckets/my-bucket/folders/archive/logs/').
+    if not full_resource_name.startswith(expected_validation_prefix) or not full_resource_name.endswith("/"):
+        raise ValueError(f"Invalid folder resource name: {full_resource_name}")
 
-  The "depth" is the number of '/' in the simple path (e.g. 'archive/logs/' is
-  depth 2).
-
-  Args:
-    full_resource_name: The full resource name of the GCS folder, e.g.,
-      'projects/_/buckets/your-bucket-name/folders/path/to/folder/'.
-
-  Returns:
-    A tuple (simple_path: str, depth: int).
-
-  Raises:
-    ValueError: If the resource name does not match the expected format
-      (i.e. start with 'projects/_/buckets/BUCKET_NAME/folders/FOLDER_PREFIX'
-      and ends with a trailing slash).
-  """
-  base_folders_prefix = f"projects/_/buckets/{BUCKET_NAME}/folders/"
-  # The full prefix to validate against, including the global FOLDER_PREFIX.
-  # If FOLDER_PREFIX is "", this is equivalent to base_folders_prefix.
-  expected_validation_prefix = base_folders_prefix + FOLDER_PREFIX
-
-  if not full_resource_name.startswith(
-      expected_validation_prefix
-  ) or not full_resource_name.endswith("/"):
-    raise ValueError(
-        f"Folder resource name '{full_resource_name}' does not match expected"
-        f" prefix '{expected_validation_prefix}' or missing trailing slash."
-    )
-
-  simple_path = full_resource_name[len(base_folders_prefix) :]
-  depth = simple_path.count("/")
-  if depth < 1:
-    raise ValueError(
-        f"Folder resource name '{full_resource_name}' has invalid depth"
-        f" {depth} (expected at least 1)."
-    )
-  return simple_path, depth
-
+    simple_path = full_resource_name[len(base_folders_prefix) :]
+    depth = simple_path.count("/")
+    return simple_path, depth
 
 def discover_and_partition_folders():
-  """Discovers all folders in the bucket and partitions them by depth.
+    parent_resource = f"projects/_/buckets/{BUCKET_NAME}"
+    list_folders_request = storage_control_v2.ListFoldersRequest(
+        parent=parent_resource, prefix=FOLDER_PREFIX
+    )
 
-  Result is stored in the global folders_by_depth dictionary.
-  """
-  parent_resource = f"projects/_/buckets/{BUCKET_NAME}"
+    num_folders_found = 0
+    try:
+        for folder in storage_control_client.list_folders(request=list_folders_request):
+            full_resource_name = folder.name
+            _, depth = _get_simple_path_and_depth(full_resource_name)
 
-  logging.info(
-      "Starting folder discovery and partitioning for bucket '%s'."
-      " Using prefix filter: '%s'.",
-      BUCKET_NAME,
-      FOLDER_PREFIX if FOLDER_PREFIX else "NONE (all folders)",
-  )
+            if depth not in folders_by_depth:
+                folders_by_depth[depth] = set()
+            folders_by_depth[depth].add(full_resource_name)
 
-  list_folders_request = storage_control_v2.ListFoldersRequest(
-      parent=parent_resource, prefix=FOLDER_PREFIX
-  )
+            num_folders_found += 1
+            with stats_lock:
+                stats["found_total"] = num_folders_found
+    except Exception as e:
+        logging.error("Failed to list folders: %s", e, exc_info=True)
 
-  num_folders_found = 0
-  try:
-    for folder in storage_control_client.list_folders(
-        request=list_folders_request
-    ):
-      full_resource_name = folder.name
-      _, depth = _get_simple_path_and_depth(full_resource_name)
-
-      if depth not in folders_by_depth:
-        folders_by_depth[depth] = set()
-      folders_by_depth[depth].add(full_resource_name)
-
-      num_folders_found += 1
-      with stats_lock:
-        stats["found_total"] = num_folders_found
-
-  except Exception as e:
-    logging.error("Failed to list folders: %s", e, exc_info=True)
-    return
-
-  logging.info(
-      "Finished discovery. Total folders found: %s.", num_folders_found
-  )
-  if not folders_by_depth:
-    logging.info("No folders found in the bucket.")
-  else:
-    logging.info("Folders partitioned by depth:")
-    for depth_val in sorted(folders_by_depth.keys()):
-      logging.info(
-          "  Depth %s: %s folders", depth_val, len(folders_by_depth[depth_val])
-      )
-
-
-# Defines retriable error codes for the DeleteFolder API call.
 def should_retry(exception):
-  if not isinstance(
-      exception, (google_exceptions.GoogleAPICallError, grpc.RpcError)
-  ):
-    return False
-
-  # gRPC status codes to retry on, matching the JSON
-  retryable_grpc_codes = [
-      grpc.StatusCode.RESOURCE_EXHAUSTED,
-      grpc.StatusCode.UNAVAILABLE,
-      grpc.StatusCode.INTERNAL,
-      grpc.StatusCode.UNKNOWN,
-  ]
-
-  status_code = None
-  if isinstance(exception, google_exceptions.GoogleAPICallError):
-    status_code = exception.code
-  elif isinstance(exception, grpc.RpcError):
-    # For grpc.RpcError, code() returns the status code enum
-    status_code = exception.code()
-
-  return status_code in retryable_grpc_codes
-
+    if not isinstance(exception, (google_exceptions.GoogleAPICallError, grpc.RpcError)):
+        return False
+    retryable_grpc_codes = [
+        grpc.StatusCode.RESOURCE_EXHAUSTED,
+        grpc.StatusCode.UNAVAILABLE,
+        grpc.StatusCode.INTERNAL,
+        grpc.StatusCode.UNKNOWN,
+    ]
+    status_code = exception.code if isinstance(exception, google_exceptions.GoogleAPICallError) else exception.code()
+    return status_code in retryable_grpc_codes
 
 def delete_folder(folder_full_resource_name: str):
-  """Attempts to delete a single GCS HNS folder.
+    simple_path, _ = _get_simple_path_and_depth(folder_full_resource_name)
+    retry_policy = retry.Retry(predicate=should_retry, initial=1.0, maximum=60.0, multiplier=2.0, deadline=120.0)
 
-  Includes retry logic for transient errors.
+    try:
+        request = storage_control_v2.DeleteFolderRequest(name=folder_full_resource_name)
+        storage_control_client.delete_folder(request=request, retry=retry_policy)
+        with stats_lock:
+            stats["successful_deletes"] += 1
+    except google_exceptions.NotFound:
+        return
+    except google_exceptions.FailedPrecondition as e:
+        logging.warning("Folder '%s' not empty: %s", simple_path, e.message)
+        with stats_lock:
+            stats["failed_deletes_precondition"] += 1
+    except Exception as e:
+        logging.error("Failed to delete '%s': %s", simple_path, e)
+        with stats_lock:
+            stats["failed_deletes_internal"] += 1
 
-  Stores stats in the global stats dictionary.
+# --- Stats Reporting ---
 
-  Args:
-      folder_full_resource_name: The full resource name of the GCS folder to
-        delete, e.g.,
-        'projects/_/buckets/your-bucket-name/folders/path/to/folder/'.
-  """
-  simple_path, _ = _get_simple_path_and_depth(folder_full_resource_name)
-
-  retry_policy = retry.Retry(
-      predicate=should_retry,
-      initial=1.0,  # Initial backoff: 1s
-      maximum=60.0,  # Max backoff: 60s
-      multiplier=2.0,  # Backoff multiplier: 2
-      deadline=120.0,  # Total time allowed for all retries and calls
-  )
-
-  try:
-    request = storage_control_v2.DeleteFolderRequest(
-        name=folder_full_resource_name
-    )
-    storage_control_client.delete_folder(request=request, retry=retry_policy)
-
-    with stats_lock:
-      stats["successful_deletes"] += 1
-    return  # Success
-
-  except google_exceptions.NotFound:
-    # This can happen if the folder was deleted by another process.
-    logging.warning(
-        "Folder not found for deletion (already gone?): %s", simple_path
-    )
-    return  # Not a retriable error
-  except google_exceptions.FailedPrecondition as e:
-    # This typically means the folder contains objects.
-    logging.warning("Deletion failed for '%s': %s.", simple_path, e.message)
-    with stats_lock:
-      stats["failed_deletes_precondition"] += 1
-    return  # Not a retriable error
-  except Exception as e:
-    logging.error(
-        "Failed to delete '%s': %s",
-        simple_path,
-        e,
-        exc_info=True,
-    )
-    with stats_lock:
-      stats["failed_deletes_internal"] += 1
-    return  # All retries exhausted
-
-
-# --- STATS REPORTER THREAD ---
 def stats_reporter_thread_logic(stop_event: threading.Event, start_time: float):
-  """Logs current statistics periodically."""
-  logging.info("Stats Reporter: Started.")
-  while not stop_event.wait(STATS_REPORT_INTERVAL):
-    with stats_lock:
-      elapsed = time.time() - start_time
-      rate = stats["successful_deletes"] / elapsed if elapsed > 0 else 0
-      logging.info(
-          "[STATS] Total Folders Found: %s | Successful Deletes: %s | Failed"
-          " Deletes (precondition): %s | Failed Deletes (internal): %s | Rate:"
-          " %.2f folders/sec",
-          stats["found_total"],
-          stats["successful_deletes"],
-          stats["failed_deletes_precondition"],
-          stats["failed_deletes_internal"],
-          rate,
-      )
-  logging.info("Stats Reporter: Shutting down.")
+    while not stop_event.wait(STATS_REPORT_INTERVAL):
+        with stats_lock:
+            elapsed = time.time() - start_time
+            rate = stats["successful_deletes"] / elapsed if elapsed > 0 else 0
+            logging.info(f"[STATS] Found: {stats['found_total']} | Success: {stats['successful_deletes']} | Rate: {rate:.2f} f/s")
 
+# --- Main Execution ---
 
-# --- MAIN EXECUTION BLOCK ---
 if __name__ == "__main__":
-  if BUCKET_NAME == "your-gcs-bucket-name":
-    print(
-        "\nERROR: Please update the BUCKET_NAME variable in the script before"
-        " running."
-    )
-    exit(1)
+    if BUCKET_NAME == "your-gcs-bucket-name":
+        print("ERROR: Update BUCKET_NAME first."); exit(1)
+    if FOLDER_PREFIX and not FOLDER_PREFIX.endswith("/"):
+        print("ERROR: FOLDER_PREFIX must end with '/'."); exit(1)
 
-  if FOLDER_PREFIX and not FOLDER_PREFIX.endswith("/"):
-    print("\nERROR: FOLDER_PREFIX must end with a '/' if specified.")
-    exit(1)
+    start_time = time.time()
+    stop_event = threading.Event()
+    
+    stats_thread = threading.Thread(target=stats_reporter_thread_logic, args=(stop_event, start_time), daemon=True)
+    stats_thread.start()
 
-  start_time = time.time()
+    # Step 0: Object Deletion
+    if DELETE_OBJECTS_FIRST:
+        clear_all_objects_batched()
 
-  logging.info("Starting GCS HNS folder deletion for bucket: %s", BUCKET_NAME)
+    # Step 1: Folder Discovery
+    discover_and_partition_folders()
 
-  # Event to signal threads to stop gracefully.
-  stop_event = threading.Event()
+    if not folders_by_depth:
+        logging.info("No folders found. Exiting."); exit(0)
 
-  # Start the stats reporter thread.
-  stats_thread = threading.Thread(
-      target=stats_reporter_thread_logic,
-      args=(stop_event, start_time),
-      name="StatsReporter",
-      daemon=True,
-  )
-  stats_thread.start()
-
-  # Step 1: Discover and Partition Folders.
-  discover_and_partition_folders()
-
-  if not folders_by_depth:
-    logging.info("No folders found to delete. Exiting.")
-    exit(0)
-
-  # Prepare for multi-threaded deletion within each depth level.
-  deletion_executor = ThreadPoolExecutor(
-      max_workers=MAX_WORKERS, thread_name_prefix="DeleteFolderWorker"
-  )
-
-  try:
-    # Step 2: Iterate and delete by depth (from max to min).
-    sorted_depths = sorted(folders_by_depth.keys(), reverse=True)
-    for current_depth in sorted_depths:
-      folders_at_current_depth = folders_by_depth.get(current_depth, set())
-
-      if not folders_at_current_depth:
-        logging.info(
-            "Skipping depth %s: No folders found at this depth.", current_depth
-        )
-        continue
-
-      logging.info(
-          "\nProcessing depth %s: Submitting %s folders for deletion...",
-          current_depth,
-          len(folders_at_current_depth),
-      )
-
-      # Submit deletion tasks to the executor.
-      futures = [
-          deletion_executor.submit(delete_folder, folder_path)
-          for folder_path in folders_at_current_depth
-      ]
-
-      # Wait for all tasks at the current depth to complete.
-      # This is critical: we must ensure all nested folders are gone before
-      # tackling their parents.
-      concurrent.futures.wait(futures)
-
-      logging.info(
-          "Finished processing all folders at depth %s.", current_depth
-      )
-
-  except KeyboardInterrupt:
-    logging.info(
-        "Main: Keyboard interrupt received. Attempting graceful shutdown..."
-    )
-  except Exception as e:
-    logging.error(
-        "An unexpected error occurred in the main loop: %s", e, exc_info=True
-    )
-  finally:
-    # Signal all threads to stop.
-    stop_event.set()
-
-    # Shut down deletion executor and wait for any pending tasks to complete.
-    logging.info(
-        "Main: Shutting down deletion workers. Waiting for any final tasks..."
-    )
-    deletion_executor.shutdown(wait=True)
-
-    # Wait for the stats reporter to finish.
-    if stats_thread.is_alive():
-      stats_thread.join(
-          timeout=STATS_REPORT_INTERVAL + 2
-      )  # Give it a bit more time.
-
-    # Log final statistics.
-    final_elapsed_time = time.time() - start_time
-    logging.info("\n--- FINAL SUMMARY ---")
-    with stats_lock:
-      final_rate = (
-          stats["successful_deletes"] / final_elapsed_time
-          if final_elapsed_time > 0
-          else 0
-      )
-      logging.info(
-          "  - Total Folders Found (Initial Scan): %s\n  - Successful Folder"
-          " Deletes: %s\n  - Failed Folder Deletes (Precondition): %s\n  -"
-          " Failed Folder Deletes (Internal): %s\n  - Total Runtime: %.2f"
-          " seconds\n  - Average Deletion Rate: %.2f folders/sec",
-          stats["found_total"],
-          stats["successful_deletes"],
-          stats["failed_deletes_precondition"],
-          stats["failed_deletes_internal"],
-          final_elapsed_time,
-          final_rate,
-      )
-    logging.info("Script execution finished.")
+    # Step 2: Recursive Folder Deletion
+    deletion_executor = ThreadPoolExecutor(max_workers=MAX_WORKERS, thread_name_prefix="DeleteWorker")
+    try:
+        for current_depth in sorted(folders_by_depth.keys(), reverse=True):
+            folders = folders_by_depth[current_depth]
+            logging.info(f"Depth {current_depth}: Deleting {len(folders)} folders...")
+            futures = [deletion_executor.submit(delete_folder, f) for f in folders]
+            concurrent.futures.wait(futures)
+    except KeyboardInterrupt:
+        logging.info("Interrupt received.")
+    finally:
+        stop_event.set()
+        deletion_executor.shutdown(wait=True)
+        logging.info("Execution finished.")
