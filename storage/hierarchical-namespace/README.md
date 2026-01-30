@@ -30,6 +30,8 @@ This script recursively deletes empty folders within a specified GCS bucket and
     *   `FOLDER_PREFIX`: (Optional) The prefix to limit deletion scope (e.g.,
         `archive/`). Leave empty to scan the whole bucket. Must end with `/` if
         specified.
+    *   `DELETE_OBJECTS_FIRST`: (Optional) Delete objects within the deletion
+        scope.
     *   `MAX_WORKERS`: Number of concurrent deletion threads.
 3.  **Run:** `bash python3 delete_empty_folders.py`
 
